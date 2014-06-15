@@ -97,58 +97,42 @@ void unregister_connection(int clientnum) {
     clienttoirc = realloc(clienttoirc, sizeof(int) * numConnections * 2);
 }
 
-void handle_event(struct epoll_event ev, char *buffer) {
+int copy_data(int fd1, int fd2) {
+    char buffer[BUF_SIZE];
+    int conn_status;
+    conn_status = read(fd1, buffer, BUF_SIZE - 1);
+    if(conn_status < 0) {
+        perror("read from client");
+        exit(EXIT_FAILURE);
+    }
+    buffer[conn_status] = '\0';
+    printf("Client -> IRC: %d bytes\n", conn_status);
+    conn_status = write(fd2, buffer, strlen(buffer));
+    if(conn_status < 0) {
+        perror("write: clienttoirc[i * 2 + 1]");
+        exit(EXIT_FAILURE);
+    }
+
+    return conn_status;
+}
+
+void handle_event(struct epoll_event ev) {
     int fd = ev.data.fd;
     printf("Handling event from fd %d\n", fd);
     int i, conn_status;
     for(i = 0; i < numConnections; i++) {
         if(fd == clients[i]) {
-            conn_status = -1;
-            if(ev.events & EPOLLIN) {
-                printf("Reading from client fd %d\n", fd);
-                conn_status = read(fd, buffer, BUF_SIZE - 1);
-                if(conn_status < 0) {
-                    perror("read from client");
-                    exit(EXIT_FAILURE);
-                }
-                buffer[conn_status] = '\0';
-                printf("Client -> IRC: %d bytes\n", conn_status);
-                conn_status = write(clienttoirc[i * 2 + 1], buffer, strlen(buffer));
-                if(conn_status < 0) {
-                    perror("write: clienttoirc[i * 2 + 1]");
-                    exit(EXIT_FAILURE);
-                }
-            } 
-            if(conn_status == 0 || ev.events & EPOLLRDHUP || ev.events & EPOLLHUP) {
-                kill(opensslpids[i], SIGTERM);
-                printf("Closing socket %d\n", irctoclient[2 * i]);
-                close(irctoclient[2 * i]);
-                printf("Closing socket %d\n", clients[i]);
-                close(clients[i]);
-                unregister_connection(i);
-            }
+            conn_status = copy_data(clients[i], clienttoirc[i * 2 + 1]);
         } else if(fd == irctoclient[i * 2]) {
-            printf("Reading from server fd %d\n", fd);
-            int conn_status = read(irctoclient[i * 2], buffer, BUF_SIZE - 1);
-            if(conn_status < 0) {
-                perror("read: irctoclient[0]");
-                exit(EXIT_FAILURE);
-            } else if(conn_status > 0) {
-                buffer[conn_status] = '\0';
-                printf("IRC -> Client: %d bytes\n", conn_status);
-                conn_status = write(clients[i], buffer, strlen(buffer));
-                if(conn_status < 0) {
-                    perror("write to client");
-                    exit(EXIT_FAILURE);
-                }
-            } else {
-                kill(opensslpids[i], SIGTERM);
-                printf("Closing socket %d\n", irctoclient[i * 2]);
-                close(irctoclient[i * 2]);
-                printf("Closing socket %d\n", clients[i]);
-                close(clients[i]);
-                unregister_connection(i);
-            }
+            conn_status = copy_data(irctoclient[i * 2], clients[i]);
+        }
+        if(conn_status == 0) {
+            kill(opensslpids[i], SIGTERM);
+            printf("Closing socket %d\n", irctoclient[i * 2]);
+            close(irctoclient[i * 2]);
+            printf("Closing socket %d\n", clients[i]);
+            close(clients[i]);
+            unregister_connection(i);
         }
     }
 }
@@ -206,8 +190,6 @@ int main(int argc, char *argv) {
         exit(EXIT_FAILURE);
     }
 
-    char *buffer = malloc(sizeof(char) * BUF_SIZE);
-
     struct epoll_event events[2];
 
     printf("Listening on socket\n");
@@ -232,7 +214,7 @@ int main(int argc, char *argv) {
                 }
                 handle_connection(conn_s);
             } else {
-                handle_event(events[n], buffer);
+                handle_event(events[n]);
             } 
         }
     }

@@ -1,2 +1,2 @@
 all:
-	gcc encrypter.c -o encrypter
+	gcc -ggdb -std=gnu99 encrypter.c -o encrypter

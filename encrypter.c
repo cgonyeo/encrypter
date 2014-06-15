@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <errno.h>
 
@@ -22,7 +23,7 @@ int *clienttoirc = NULL;
 int *clients = NULL;
 int *opensslpids = NULL;
 
-void handleConnection(int conn_s)
+void handle_connection(int conn_s)
 {
     printf("New connection with fd %d\n", conn_s);
     int location = numConnections * 2;
@@ -50,6 +51,8 @@ void handleConnection(int conn_s)
     if(childpid == 0)
     {
         /* Child process */
+        close(clienttoirc[location + 1]);
+        close(irctoclient[location]);
         dup2(clienttoirc[location], 0); //stdin
         dup2(irctoclient[location + 1], 1); //stdout
 
@@ -58,6 +61,8 @@ void handleConnection(int conn_s)
     else
     {
         /* Parent process */
+        close(clienttoirc[location]);
+        close(irctoclient[location + 1]);
         opensslpids[numConnections - 1] = childpid;
 
         struct epoll_event ev;
@@ -73,23 +78,41 @@ void handleConnection(int conn_s)
             perror("epoll_ctl: listen_sock");
             exit(EXIT_FAILURE);
         }
+
+        printf("New pipe irc->client: %d\n", (irctoclient[location]));
     }
+}
+
+void unregister_connection(int clientnum) {
+    for(int i = clientnum; i < numConnections; i++) {
+        clients[i] = clients[i + 1];
+        irctoclient[i] = irctoclient[i + 2];
+        irctoclient[i + 1] = irctoclient[i + 3];
+        clienttoirc[i] = clienttoirc[i + 2];
+        clienttoirc[i + 1] = clienttoirc[i + 3];
+    }
+    numConnections--;
+    clients = realloc(clients, sizeof(int) * numConnections);
+    irctoclient = realloc(irctoclient, sizeof(int) * numConnections * 2);
+    clienttoirc = realloc(clienttoirc, sizeof(int) * numConnections * 2);
 }
 
 void handle_event(struct epoll_event ev, char *buffer) {
     int fd = ev.data.fd;
+    printf("Handling event from fd %d\n", fd);
     int i, conn_status;
     for(i = 0; i < numConnections; i++) {
         if(fd == clients[i]) {
             conn_status = -1;
             if(ev.events & EPOLLIN) {
+                printf("Reading from client fd %d\n", fd);
                 conn_status = read(fd, buffer, BUF_SIZE - 1);
                 if(conn_status < 0) {
                     perror("read from client");
                     exit(EXIT_FAILURE);
                 }
                 buffer[conn_status] = '\0';
-                printf("Client -> IRC (%d): %s\n", conn_status, buffer);
+                printf("Client -> IRC: %d bytes\n", conn_status);
                 conn_status = write(clienttoirc[i * 2 + 1], buffer, strlen(buffer));
                 if(conn_status < 0) {
                     perror("write: clienttoirc[i * 2 + 1]");
@@ -97,45 +120,34 @@ void handle_event(struct epoll_event ev, char *buffer) {
                 }
             } 
             if(conn_status == 0 || ev.events & EPOLLRDHUP || ev.events & EPOLLHUP) {
-                printf("Closing socket %d\n", fd);
-                if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL) != 0) {
-                    perror("epoll_ctl, deleting fd");
-                    exit(EXIT_FAILURE);
-                }
-                if(epoll_ctl(epollfd, EPOLL_CTL_DEL, irctoclient[i * 2], NULL) != 0) {
-                    perror("epoll_ctl, deleting fd");
-                    exit(EXIT_FAILURE);
-                }
                 kill(opensslpids[i], SIGTERM);
+                printf("Closing socket %d\n", irctoclient[2 * i]);
                 close(irctoclient[2 * i]);
-                close(fd);
+                printf("Closing socket %d\n", clients[i]);
+                close(clients[i]);
+                unregister_connection(i);
             }
         } else if(fd == irctoclient[i * 2]) {
+            printf("Reading from server fd %d\n", fd);
             int conn_status = read(irctoclient[i * 2], buffer, BUF_SIZE - 1);
             if(conn_status < 0) {
                 perror("read: irctoclient[0]");
                 exit(EXIT_FAILURE);
             } else if(conn_status > 0) {
                 buffer[conn_status] = '\0';
-                printf("IRC -> Client (%d): %s\n", conn_status, buffer);
+                printf("IRC -> Client: %d bytes\n", conn_status);
                 conn_status = write(clients[i], buffer, strlen(buffer));
                 if(conn_status < 0) {
                     perror("write to client");
                     exit(EXIT_FAILURE);
                 }
             } else {
-                printf("Closing socket %d\n", fd);
-                if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL) != 0) {
-                    perror("epoll_ctl, deleting fd");
-                    exit(EXIT_FAILURE);
-                }
-                if(epoll_ctl(epollfd, EPOLL_CTL_DEL, clients[i], NULL) != 0) {
-                    perror("epoll_ctl, deleting fd");
-                    exit(EXIT_FAILURE);
-                }
                 kill(opensslpids[i], SIGTERM);
-                close(fd);
+                printf("Closing socket %d\n", irctoclient[i * 2]);
+                close(irctoclient[i * 2]);
+                printf("Closing socket %d\n", clients[i]);
                 close(clients[i]);
+                unregister_connection(i);
             }
         }
     }
@@ -200,7 +212,7 @@ int main(int argc, char *argv) {
 
     printf("Listening on socket\n");
     for (;;) {
-        nfds = epoll_wait(epollfd, events, 2, 1000);
+        nfds = epoll_wait(epollfd, events, 2, 5000);
         if (nfds == -1 && errno != EINTR) {
             perror("epoll_pwait");
             exit(EXIT_FAILURE);
@@ -218,8 +230,7 @@ int main(int argc, char *argv) {
                     perror("accept");
                     exit(EXIT_FAILURE);
                 }
-                printf("New connection\n");
-                handleConnection(conn_s);
+                handle_connection(conn_s);
             } else {
                 handle_event(events[n], buffer);
             } 

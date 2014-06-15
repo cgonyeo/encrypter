@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -84,6 +85,12 @@ void handle_connection(int conn_s)
 }
 
 void unregister_connection(int clientnum) {
+    kill(opensslpids[clientnum], SIGTERM);
+    printf("Closing socket %d\n", irctoclient[clientnum * 2]);
+    close(irctoclient[clientnum * 2]);
+    printf("Closing socket %d\n", clients[clientnum]);
+    close(clients[clientnum]);
+
     for(int i = clientnum; i < numConnections; i++) {
         clients[i] = clients[i + 1];
         irctoclient[i] = irctoclient[i + 2];
@@ -95,6 +102,9 @@ void unregister_connection(int clientnum) {
     clients = realloc(clients, sizeof(int) * numConnections);
     irctoclient = realloc(irctoclient, sizeof(int) * numConnections * 2);
     clienttoirc = realloc(clienttoirc, sizeof(int) * numConnections * 2);
+
+    int stat_loc;
+    waitpid(opensslpids[clientnum], &stat_loc, 0);
 }
 
 int copy_data(int fd1, int fd2) {
@@ -105,9 +115,9 @@ int copy_data(int fd1, int fd2) {
         perror("read from client");
         exit(EXIT_FAILURE);
     }
-    buffer[conn_status] = '\0';
+    
     printf("Client -> IRC: %d bytes\n", conn_status);
-    conn_status = write(fd2, buffer, strlen(buffer));
+    conn_status = write(fd2, buffer, conn_status);
     if(conn_status < 0) {
         perror("write: clienttoirc[i * 2 + 1]");
         exit(EXIT_FAILURE);
@@ -119,20 +129,48 @@ int copy_data(int fd1, int fd2) {
 void handle_event(struct epoll_event ev) {
     int fd = ev.data.fd;
     printf("Handling event from fd %d\n", fd);
-    int i, conn_status;
-    for(i = 0; i < numConnections; i++) {
+    int conn_status;
+    for(int i = 0; i < numConnections; i++) {
         if(fd == clients[i]) {
             conn_status = copy_data(clients[i], clienttoirc[i * 2 + 1]);
         } else if(fd == irctoclient[i * 2]) {
             conn_status = copy_data(irctoclient[i * 2], clients[i]);
         }
         if(conn_status == 0) {
-            kill(opensslpids[i], SIGTERM);
-            printf("Closing socket %d\n", irctoclient[i * 2]);
-            close(irctoclient[i * 2]);
-            printf("Closing socket %d\n", clients[i]);
-            close(clients[i]);
             unregister_connection(i);
+        }
+    }
+}
+
+void epoll_loop(int list_s) {
+
+    int nfds;
+    struct epoll_event events[2];
+
+    printf("Listening on socket\n");
+    for (;;) {
+        nfds = epoll_wait(epollfd, events, 2, 5000);
+        if (nfds == -1 && errno != EINTR) {
+            perror("epoll_pwait");
+            exit(EXIT_FAILURE);
+        }
+        printf("epoll_wait returned, %d fds\n", nfds);
+
+        int n;
+        for (n = 0; n < nfds; ++n) {
+            int fd = events[n].data.fd;
+
+            if(fd == list_s) {
+                int conn_s = 0;
+                if((conn_s = accept(list_s, NULL, NULL)) < 0)
+                {
+                    perror("accept");
+                    exit(EXIT_FAILURE);
+                }
+                handle_connection(conn_s);
+            } else {
+                handle_event(events[n]);
+            } 
         }
     }
 }
@@ -143,6 +181,8 @@ int main(int argc, char *argv) {
     int list_s;        //Listening socket
     short int port = INCPORT;    //port number
     struct sockaddr_in servaddr;    //socket address struct
+
+    //Network setup
     if((list_s = socket(AF_INET, SOCK_STREAM, 0)) < 0) 
     {
         printf("Error making listening socket\n");
@@ -173,14 +213,13 @@ int main(int argc, char *argv) {
         exit(EXIT_FAILURE);
     }
 
-    int nfds;
-
     epollfd = epoll_create1(0);
     if (epollfd == -1) {
         perror("epoll_create");
         exit(EXIT_FAILURE);
     }
 
+    //Epoll setup
     struct epoll_event ev;
 
     ev.events = EPOLLIN;
@@ -190,32 +229,6 @@ int main(int argc, char *argv) {
         exit(EXIT_FAILURE);
     }
 
-    struct epoll_event events[2];
-
-    printf("Listening on socket\n");
-    for (;;) {
-        nfds = epoll_wait(epollfd, events, 2, 5000);
-        if (nfds == -1 && errno != EINTR) {
-            perror("epoll_pwait");
-            exit(EXIT_FAILURE);
-        }
-        printf("epoll_wait returned, %d fds\n", nfds);
-
-        int n;
-        for (n = 0; n < nfds; ++n) {
-            int fd = events[n].data.fd;
-
-            if(fd == list_s) {
-                int conn_s = 0;
-                if((conn_s = accept(list_s, NULL, NULL)) < 0)
-                {
-                    perror("accept");
-                    exit(EXIT_FAILURE);
-                }
-                handle_connection(conn_s);
-            } else {
-                handle_event(events[n]);
-            } 
-        }
-    }
+    //Call loop to wait for connections
+    epoll_loop(list_s);
 }
